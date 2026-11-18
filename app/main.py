@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -11,6 +12,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
 from redis.asyncio import Redis
+from redis.asyncio.connection import ConnectionPool
+from redis.backoff import ExponentialBackoff
+from redis.retry import Retry
+from redis.exceptions import BusyLoadingError, ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
 
 from .cache import ServiceError, TagService
 from .config import Settings, settings
@@ -70,14 +75,24 @@ def _install_error_handler(app: FastAPI) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     cfg: Settings = app.state.settings
-    redis = Redis.from_url(
+    # Explicit pool sizing: a burst of concurrent single-flight requests plus
+    # the background readiness ping must not exhaust the default pool and turn
+    # a healthy Redis into spurious ConnectionError 503s.  A short retry policy
+    # transparently reconnects when an idle pooled connection was dropped, so
+    # a request only sees a 503 when Redis is genuinely unavailable.
+    retry = Retry(ExponentialBackoff(cap=0.2, base=0.02), 3)
+    pool = ConnectionPool.from_url(
         cfg.redis_url,
         decode_responses=True,
         socket_timeout=cfg.redis_socket_timeout_ms / 1000,
         socket_connect_timeout=cfg.redis_socket_timeout_ms / 1000,
         health_check_interval=15,
-        retry_on_timeout=False,
+        retry_on_timeout=True,
+        retry_on_error=[RedisConnectionError, RedisTimeoutError, BusyLoadingError],
+        retry=retry,
+        max_connections=128,
     )
+    redis = Redis(connection_pool=pool)
     origin = httpx.AsyncClient(
         base_url=cfg.origin_url,
         timeout=cfg.origin_timeout_ms / 1000,
@@ -85,19 +100,40 @@ async def lifespan(app: FastAPI):
     )
     app.state.redis = redis
     app.state.origin = origin
-    app.state.service = TagService(redis, origin, cfg)
-    try:
-        await redis.ping()
-        logger.info(
-            "instance %s connected to redis, origin=%s",
-            cfg.instance_name,
-            cfg.origin_url,
-        )
-    except Exception as exc:  # noqa: BLE001 - startup diagnostics only
-        logger.warning("redis not reachable at startup: %r", exc)
+    service = TagService(redis, origin, cfg)
+    app.state.service = service
+
+    async def readiness_monitor() -> None:
+        # Tracks Redis availability across crashes/restarts.  While Redis is
+        # down or replaying its AOF, service.ready stays False and every
+        # coordinated request fails fast with an explicit 503 instead of
+        # rebuilding the cache from late origin replies.  Two consecutive
+        # failures are required to flip to not-ready, so a single dropped idle
+        # connection (which the request path retries transparently) does not
+        # cause a spurious "recovering" blip.
+        consecutive_failures = 0
+        while True:
+            try:
+                await redis.ping()
+                consecutive_failures = 0
+                service.mark_ready(True)
+            except Exception as exc:  # noqa: BLE001 - any failure means not ready
+                consecutive_failures += 1
+                if consecutive_failures >= 2:
+                    service.mark_ready(False, exc.__class__.__name__)
+                logger.warning("redis readiness check failed (%d): %r",
+                               consecutive_failures, exc)
+            await asyncio.sleep(1.0)
+
+    monitor_task = asyncio.create_task(readiness_monitor())
     try:
         yield
     finally:
+        monitor_task.cancel()
+        try:
+            await monitor_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
         await origin.aclose()
         await redis.aclose()
 
@@ -137,11 +173,15 @@ def _register_routes(app: FastAPI) -> None:
         redis_error = None
         try:
             await service.redis.ping()
+            service.mark_ready(True)
         except Exception as exc:  # noqa: BLE001
             redis_ok = False
             redis_error = exc.__class__.__name__
+            service.mark_ready(False, redis_error)
         return {
-            "status": "ok" if redis_ok else "degraded",
+            "status": "ok" if redis_ok and service.ready else "degraded",
+            "ready": bool(service.ready and redis_ok),
+            "recovering": not bool(service.ready and redis_ok),
             "instance": app.state.settings.instance_name,
             "redis": {"ok": redis_ok, "error": redis_error},
             "public_instances": list(app.state.settings.public_instances),

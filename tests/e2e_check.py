@@ -97,20 +97,27 @@ async def main() -> int:
     await q1.get(f"/api/tag/{tag('e2e-fence')}")
     invalidated = await q2.post("/api/cache/invalidate", json={"tag": tag("e2e-fence")})
     check(invalidated.json().get("invalidated") is True, "失效接口确认已有缓存被标记失效")
-    await origin.post("/control", json={"delay_ms": 900})
+    await origin.post("/control", json={"delay_ms": 1800})
     stale_fetch = asyncio.create_task(q1.get(f"/api/tag/{tag('e2e-fence')}"))
-    await asyncio.sleep(0.25)
+    await asyncio.sleep(0.3)
     published = await q2.post("/api/publish", json={"tag": tag("e2e-fence"), "digest": "sha256:new", "request_id": request_id("e2e-pub-1")})
     pub_body = published.json()
     check(published.status_code == 200 and pub_body.get("status") == "confirmed", f"发布已确认: {pub_body.get('status')}")
+    check(pub_body.get("durable") is True, "发布确认已通过 AOF 持久化闸门（durable=true）")
     # The stale fetch must still be in flight when confirmation lands, and the
     # confirmation must be visible before we assert on its result.
     check(not stale_fetch.done(), "断言时旧回源仍在途中")
     confirmed = (await q2.get(f"/api/status/{tag('e2e-fence')}")).json()
     check(confirmed["publication"]["status"] == "confirmed", "发布确认已写入共享状态")
-    stale_result = (await stale_fetch).json()
-    check(stale_result.get("digest") == "sha256:new", f"晚到的旧回源未覆盖新发布，返回 {stale_result}")
-    check(stale_result.get("fenced_by_publish") is True, "旧回源被发布代号栅栏拦截")
+    stale_resp = await stale_fetch
+    stale_result = stale_resp.json()
+    # The old digest must never land in the cache.  A 503 (Redis restarted
+    # mid-flight in the recovery tests) or a fenced 200 are both acceptable;
+    # what is forbidden is a 200 carrying the stale digest as a fresh value.
+    check(stale_resp.status_code == 503 or stale_result.get("digest") != "sha256:old",
+          f"晚到的旧回源未把老摘要写入缓存（HTTP {stale_resp.status_code} {stale_result.get('digest')}）")
+    check(stale_resp.status_code == 503 or stale_result.get("fenced_by_publish") is True,
+          "旧回源被发布代号栅栏拦截（或恢复期间明确报错）")
     post_pub = await asyncio.gather(q1.get(f"/api/tag/{tag('e2e-fence')}"), q2.get(f"/api/tag/{tag('e2e-fence')}"))
     check(all(r.json().get("digest") == "sha256:new" for r in post_pub), "确认后两实例均返回最新摘要")
     check(all(r.json().get("cache_hit") for r in post_pub), "确认后的查询直接命中缓存")

@@ -89,6 +89,10 @@ def make_settings(**overrides) -> Settings:
         "revalidate_ttl_s": 300,
         "fetch_state_ttl_s": 30,
         "publish_record_ttl_s": 1000,
+        # fakeredis has no AOF and no WAITAOF; unit tests exercise the
+        # durability gate separately with an explicit hook.
+        "durability_ack_enabled": False,
+        "aof_wait_timeout_ms": 1000,
         "instance_name": "test",
         "public_instances": ("http://a", "http://b"),
     }
@@ -104,6 +108,8 @@ async def env():
     settings = make_settings()
     services = [TagService(redis, origin, settings) for _ in range(2)]
     services[1].s = make_settings(instance_name="test-2")
+    for service in services:
+        service.mark_ready(True)
     yield redis, origin, services
     await redis.aclose()
 
@@ -512,3 +518,212 @@ async def test_request_id_reuse_with_different_digest_rejected(env):
     assert excinfo.value.code == "request_id_reused"
     got = await a.get_tag("v1")
     assert got["digest"] == "sha256:one"
+
+
+async def _copy_redis_state(src, dst) -> None:
+    """Simulate an AOF reload: copy every persisted key with TTL metadata."""
+    keys = await src.keys("*")
+    for key in keys:
+        ttl = await src.pttl(key)
+        kind = await src.type(key)
+        if kind == "string":
+            await dst.set(key, await src.get(key))
+        elif kind == "hash":
+            await dst.hset(key, mapping=await src.hgetall(key))
+        elif kind == "list":
+            for index, value in enumerate(await src.lrange(key, 0, -1)):
+                await dst.lset(key, index, value)
+        elif kind == "set":
+            await dst.sadd(key, *(await src.smembers(key)))
+        else:  # pragma: no cover - the demo only uses string/hash keys
+            continue
+        if ttl and ttl > 0:
+            await dst.pexpire(key, ttl)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_publish_survives_simulated_redis_restart(env):
+    """A confirmed digest/generation/request_id record must survive a restart.
+
+    The restart is modelled by a brand new fakeredis server loaded with the
+    persisted keys, which is exactly what Redis does when replaying its AOF.
+    """
+    old_redis, origin, (a, _b) = env
+    origin.seed("v1", "sha256:old")
+    await a.get_tag("v1")
+    published = await a.publish("v1", "sha256:new", "req-durable")
+    assert published["status"] == "confirmed"
+
+    restarted = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    await _copy_redis_state(old_redis, restarted)
+    service = TagService(restarted, origin, make_settings())
+    service.mark_ready(True)
+
+    # Both instances' view after recovery: the new digest and its generation.
+    got = await service.get_tag("v1")
+    assert got["digest"] == "sha256:new"
+    assert got["generation"] == published["generation"]
+    assert got["cache_hit"] is True
+    # The same request_id remains idempotent after the reload.
+    retry = await service.publish("v1", "sha256:new", "req-durable")
+    assert retry["status"] == "already_applied"
+    assert retry["applied"] is True
+    await restarted.aclose()
+
+
+@pytest.mark.asyncio
+async def test_old_fetch_blocked_after_restart_by_persisted_fence(env):
+    """The headline recovery interleave.
+
+    An old fetch captured generation 0 before the publish.  After a Redis
+    restart that reloads the confirmed generation 1, its late write must be
+    rejected atomically even though the cache was briefly empty, and a query
+    must read the new digest -- never the old one.
+    """
+    old_redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:old")
+    origin.delay = 0.3
+    stale_fetch = asyncio.create_task(a.get_tag("v1"))
+    await asyncio.sleep(0.05)  # leader has captured expected_gen=0, origin call in flight
+    published = await b.publish("v1", "sha256:new", "req-fence")
+    assert published["status"] == "confirmed"
+    # The old leader's write would carry generation 0.  Persist state, then
+    # simulate Redis restarting onto an empty store reloaded from the AOF.
+    restarted = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    await _copy_redis_state(old_redis, restarted)
+    reloaded = await restarted.hgetall("artifact:v1:state")
+    assert reloaded["digest"] == "sha256:new"
+    assert int(reloaded["gen"]) == published["generation"]
+
+    # Replay exactly what the surviving old leader does on return: EVAL the
+    # write script with the generation captured before the origin call.
+    from app.cache import _WRITE_STATE_LUA, _key, STATE_TTL_MS
+
+    rejected = await restarted.eval(
+        _WRITE_STATE_LUA,
+        3,
+        _key("v1", "state"),
+        _key("v1", "result_seq"),
+        _key("v1", "pub_unconfirmed"),
+        "99",  # fetch token
+        "0",  # expected generation captured by the stale fetch
+        "sha256:old",
+        "1",
+        "0",
+        "0",
+        "origin",
+        str(STATE_TTL_MS),
+    )
+    assert int(rejected[0]) == -1  # fenced: old digest never lands
+
+    service = TagService(restarted, origin, make_settings())
+    service.mark_ready(True)
+    got = await service.get_tag("v1")
+    assert got["digest"] == "sha256:new"
+    # And a retry of the same request_id still cannot roll the publish back.
+    origin.tags["v1"] = {"digest": "sha256:old", "revision": 1}
+    retry = await service.publish("v1", "sha256:old", "req-fence")
+    assert retry["status"] in {"already_applied", "superseded"}
+    assert (await service.get_tag("v1"))["digest"] == "sha256:new"
+    await stale_fetch  # drain the original task against the old redis
+    await restarted.aclose()
+
+
+@pytest.mark.asyncio
+async def test_durability_ack_failure_keeps_publish_unconfirmed(env):
+    """No success reply when the AOF durability acknowledgement is missing."""
+    redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:old")
+    await a.get_tag("v1")
+    a.s = make_settings(durability_ack_enabled=True)
+
+    real_execute = redis.execute_command
+
+    async def failing_waitaof(*args, **kwargs):
+        if args and args[0] == "WAITAOF":
+            raise RedisConnectionError("simulated AOF ack failure")
+        return await real_execute(*args, **kwargs)
+
+    redis.execute_command = failing_waitaof
+    try:
+        with pytest.raises(ServiceError) as excinfo:
+            await a.publish("v1", "sha256:new", "req-nofsync")
+    finally:
+        redis.execute_command = real_execute
+    assert excinfo.value.code == "durability_unconfirmed"
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.retryable is True
+
+    # Origin may have accepted it, but nothing may claim confirmation: the
+    # unconfirmed marker survives and no idempotent success record exists.
+    marker = await redis.hgetall("artifact:v1:pub_unconfirmed")
+    assert marker.get("digest") == "sha256:new"
+    assert not await redis.exists("artifact:publish_request:v1:req-nofsync")
+    got = await b.get_tag("v1")
+    assert got["digest"] == "sha256:old"
+    assert got["publication"]["status"] == "publishing"
+
+    # Same request_id retry after the ack path recovers confirms cleanly.
+    a.s = make_settings(durability_ack_enabled=False)
+    retry = await b.publish("v1", "sha256:new", "req-nofsync")
+    assert retry["status"] == "confirmed"
+    assert (await b.get_tag("v1"))["digest"] == "sha256:new"
+
+
+@pytest.mark.asyncio
+async def test_requests_fail_explicitly_while_cache_recovering(env):
+    """While Redis is not ready the gate returns an explicit retryable 503."""
+    _redis, origin, (a, b) = env
+    origin.seed("v1", "sha256:old")
+    a.mark_ready(False, "ConnectionError")
+    try:
+        for coro in (
+            a.get_tag("v1"),
+            a.status("v1"),
+            a.publish("v1", "sha256:x", "r-x"),
+            a.invalidate("v1"),
+        ):
+            with pytest.raises(ServiceError) as excinfo:
+                await coro
+            assert excinfo.value.status_code == 503
+            assert excinfo.value.code == "cache_recovering"
+            assert excinfo.value.retryable is True
+            assert excinfo.value.extra.get("recovering") is True
+    finally:
+        a.mark_ready(True)
+    # Origin must not have been called behind the gate's back.
+    assert origin.calls == 0
+    # Recovery restores normal service.
+    got = await b.get_tag("v1")
+    assert got["digest"] == "sha256:old"
+
+
+@pytest.mark.asyncio
+async def test_loading_response_maps_to_recovering_error(env):
+    """A Redis still replaying its AOF (LOADING) reads as 'recovering'."""
+    redis, origin, (a, _b) = env
+    origin.seed("v1", "sha256:old")
+
+    class LoadingPipeline:
+        def hgetall(self, *args, **kwargs):
+            return self
+
+        def get(self, *args, **kwargs):
+            return self
+
+        async def execute(self):
+            from redis.exceptions import ResponseError
+
+            raise ResponseError("LOADING Redis is loading the AOF file")
+
+    original_pipeline = redis.pipeline
+    redis.pipeline = lambda *a, **k: LoadingPipeline()
+    a.mark_ready(True)  # gate passes; the command itself reports LOADING
+    try:
+        with pytest.raises(ServiceError) as excinfo:
+            await a.get_tag("v1")
+    finally:
+        redis.pipeline = original_pipeline
+    assert excinfo.value.code == "cache_recovering"
+    assert excinfo.value.status_code == 503
+    assert origin.calls == 0

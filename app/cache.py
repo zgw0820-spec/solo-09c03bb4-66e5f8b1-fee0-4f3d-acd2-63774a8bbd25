@@ -35,6 +35,25 @@ Correctness rules:
   it exists, readers still get the last confirmed digest but the response is
   explicitly labelled ``stale_due_to_pending`` rather than presented as the
   publication's result.  It expires after ``UNCONFIRMED_TTL_S``.
+
+Recovery interleave (Redis crash/restart):
+
+* Redis runs with AOF persistence (``appendonly yes``), so every confirmed
+  ``state``/``last_publish``/generation and every ``request_id`` record that
+  a client was told succeeded is reloaded after a restart.  An old origin
+  fetch that lands after the reload is fenced by the persisted generation and
+  cannot write its stale digest into the empty cache.
+* A publication commit is followed by ``WAITAOF``: success is only returned
+  once the commit is fsync'd to the AOF.  If that acknowledgement cannot be
+  obtained (timeout, connection loss, command unavailable), the publication
+  stays *unconfirmed* and the caller gets an explicit retryable 503 even if
+  the origin accepted the write; retrying with the same ``request_id`` never
+  rolls a newer confirmed publication back.
+* While Redis is unreachable or still loading its AOF, every mutating or
+  coordinated request fails fast with an explicit
+  ``cache_recovering``/``cache_unavailable`` 503 instead of silently rebuilding
+  state from origin replies.  Reads resume only after the recovered store is
+  reachable again.
 """
 from __future__ import annotations
 
@@ -48,7 +67,7 @@ from typing import Any
 
 import httpx
 from redis.asyncio import Redis
-from redis.exceptions import RedisError
+from redis.exceptions import RedisError, ResponseError
 
 from .config import Settings
 
@@ -123,6 +142,15 @@ redis.call('HSET', KEYS[1],
   'fetch_seq', ARGV[1],
   'result_seq', tostring(result_seq),
   'fetch_state', 'ok')
+-- A revalidation never moves the publication generation, so the authoritative
+-- last-confirmed snapshot tracks the current digest.  HSETNX covers the cold
+-- cache; the second form keeps confirmed_* aligned after an earlier durable
+-- publication already populated them.
+redis.call('HSETNX', KEYS[1], 'confirmed_digest', ARGV[3])
+redis.call('HSETNX', KEYS[1], 'confirmed_gen', ARGV[2])
+if tonumber(redis.call('HGET', KEYS[1], 'confirmed_gen') or '0') == tonumber(ARGV[2]) then
+  redis.call('HSET', KEYS[1], 'confirmed_digest', ARGV[3])
+end
 redis.call('PEXPIRE', KEYS[1], ARGV[8])
 if redis.call('HGET', KEYS[3], 'digest') == ARGV[3] then
   redis.call('DEL', KEYS[3])
@@ -131,10 +159,11 @@ return {'1', result_seq}
 """
 
 # KEYS[1]=state, 2=pending, 3=fetch_seq, 4=last_publish, 5=result_seq,
-#      6=unconfirmed publication marker
+#      6=unconfirmed publication marker, 7=idempotency record
 # ARGV: 1 attempt, 2 attempt(for pending match), 3 digest, 4 origin revision,
 #       5 now_ms, 6 fresh_until_ms, 7 request_id, 8 state ttl ms,
-#       9 last_publish ttl seconds
+#       9 last_publish ttl seconds, 10 idempotency record JSON,
+#       11 idempotency ttl seconds
 _COMMIT_PUBLISH_LUA = """
 local cur = redis.call('HMGET', KEYS[1], 'gen')
 local cur_gen = tonumber(cur[1] or '0')
@@ -147,6 +176,12 @@ local pending_attempt = redis.call('HGET', KEYS[2], 'attempt_id')
 if pending_attempt and pending_attempt ~= ARGV[2] then return {-2, cur_gen} end
 local seq = redis.call('INCR', KEYS[3])
 local result_seq = redis.call('INCR', KEYS[5])
+-- Preserve the previously confirmed snapshot.  The new digest is written as
+-- the candidate immediately, but confirmed_digest/confirmed_gen only advance
+-- after the durability acknowledgement succeeds (in a follow-up script).  If
+-- WAITAOF fails, readers keep serving confirmed_* with the unconfirmed marker.
+local prev_digest = redis.call('HGET', KEYS[1], 'confirmed_digest')
+local prev_gen = redis.call('HGET', KEYS[1], 'confirmed_gen')
 redis.call('HSET', KEYS[1],
   'digest', ARGV[3],
   'origin_revision', ARGV[4],
@@ -157,6 +192,12 @@ redis.call('HSET', KEYS[1],
   'fetch_seq', tostring(seq),
   'result_seq', tostring(result_seq),
   'fetch_state', 'ok')
+if prev_digest then
+  redis.call('HSET', KEYS[1], 'confirmed_digest', prev_digest, 'confirmed_gen', prev_gen)
+else
+  redis.call('HSETNX', KEYS[1], 'confirmed_digest', ARGV[3])
+  redis.call('HSETNX', KEYS[1], 'confirmed_gen', ARGV[1])
+end
 redis.call('PEXPIRE', KEYS[1], ARGV[8])
 redis.call('HSET', KEYS[4],
   'digest', ARGV[3],
@@ -166,8 +207,15 @@ redis.call('HSET', KEYS[4],
   'request_id', ARGV[7],
   'attempt_id', ARGV[2])
 redis.call('EXPIRE', KEYS[4], ARGV[9])
+-- The idempotency record is NOT written here: it must only become visible
+-- after the durability acknowledgement (WAITAOF) succeeds, otherwise a
+-- durability failure would look like a confirmed, deduplicated publication.
+-- KEYS[7] is reserved for that post-ack write.
 if pending_attempt == ARGV[2] then redis.call('DEL', KEYS[2]) end
-redis.call('DEL', KEYS[6])
+-- NOTE: KEYS[6] (pub_unconfirmed) is deliberately NOT deleted here either.
+-- If the durability acknowledgement after this script fails, the caller must
+-- still treat this publication as unconfirmed, so the marker has to survive.
+-- Both are removed only after durability is confirmed.
 return {1, attempt, seq, result_seq}
 """
 
@@ -203,12 +251,112 @@ end
 return 0
 """
 
+# KEYS[1]=state, 2=unconfirmed marker
+# ARGV: 1 digest, 2 generation, 3 marker attempt id, 4 state ttl ms
+# Promotes the candidate digest/generation to the authoritative confirmed
+# snapshot and clears the unconfirmed marker.  Runs only after WAITAOF has
+# confirmed durability of the commit.
+_PROMOTE_CONFIRMED_LUA = """
+redis.call('HSET', KEYS[1], 'confirmed_digest', ARGV[1], 'confirmed_gen', ARGV[2])
+redis.call('PEXPIRE', KEYS[1], ARGV[4])
+if redis.call('HGET', KEYS[2], 'attempt_id') == ARGV[3] then
+  redis.call('DEL', KEYS[2])
+end
+return 1
+"""
+
 
 class TagService:
     def __init__(self, redis: Redis, origin: httpx.AsyncClient, settings: Settings) -> None:
         self.redis = redis
         self.origin = origin
         self.s = settings
+        # Readiness gate.  Starts False: until a successful Redis round-trip
+        # proves the recovered store is available (AOF loaded, connection up),
+        # coordinated requests fail fast with an explicit 503 rather than
+        # rebuilding state from late origin replies.
+        self.ready: bool = False
+        self.last_redis_error: str | None = None
+
+    def mark_ready(self, ok: bool, error: str | None = None) -> None:
+        self.ready = ok
+        if ok:
+            self.last_redis_error = None
+        elif error:
+            self.last_redis_error = error
+
+    def _require_ready(self, context: str) -> None:
+        if not self.ready:
+            raise ServiceError(
+                "cache_recovering",
+                f"缓存仍在恢复中（{self.last_redis_error or 'Redis 尚未就绪'}），"
+                f"暂不可{context}，请稍后重试",
+                503,
+                retryable=True,
+                extra={"recovering": True},
+            )
+
+    def _redis_error(
+        self, exc: Exception, context: str, *, recovering: bool = False
+    ) -> ServiceError:
+        """Map any Redis failure onto an explicit, retryable 503.
+
+        ``LOADING`` means the server is still replaying its AOF after a
+        restart; the caller must see "temporarily unavailable" instead of a
+        silently rebuilt cache.
+        """
+        message = str(exc)
+        loading = isinstance(exc, ResponseError) and "loading" in message.lower()
+        code = "cache_recovering" if (loading or recovering) else "cache_unavailable"
+        if loading:
+            text = f"缓存正在从持久化日志恢复（AOF LOADING），暂不可{context}，请稍后重试"
+        else:
+            text = f"缓存协调失败，无法{context}（{exc.__class__.__name__}），请重试"
+        return ServiceError(
+            code,
+            text,
+            503,
+            retryable=True,
+            extra={"recovering": loading or recovering},
+        )
+
+    async def _wait_durability(self) -> None:
+        """Confirm the last write is fsync'd to the AOF before acknowledging.
+
+        ``WAITAOF 1 0 <timeout>`` blocks until the local AOF has persisted all
+        writes issued on this connection (numreplicas=0: local durability
+        only).  Any failure -- timeout (0 acknowledged), connection loss, or an
+        unsupported/misconfigured server -- is treated as "durability not
+        confirmed": the publication must not be reported as successful.
+        """
+        if not self.s.durability_ack_enabled:
+            return
+        try:
+            acknowledged = await self.redis.execute_command(
+                "WAITAOF", 1, 0, self.s.aof_wait_timeout_ms
+            )
+        except RedisError as exc:
+            raise ServiceError(
+                "durability_unconfirmed",
+                f"持久化确认不可用（{exc.__class__.__name__}），发布未确认，"
+                "请用同一 request_id 重试",
+                503,
+                retryable=True,
+                extra={"durability": "unsupported"},
+            ) from exc
+        try:
+            num_local = int(acknowledged[0])
+        except (TypeError, ValueError, IndexError):
+            num_local = 0
+        if num_local < 1:
+            raise ServiceError(
+                "durability_unconfirmed",
+                f"等待 AOF 持久化确认超时（{self.s.aof_wait_timeout_ms}ms），"
+                "发布未确认，请用同一 request_id 重试",
+                503,
+                retryable=True,
+                extra={"durability": "timeout"},
+            )
 
     # ---------------------------------------------------------------- basics
     async def _stat(self, name: str) -> None:
@@ -276,12 +424,7 @@ class TagService:
         try:
             snap = await self._miss_snapshot(tag)
         except RedisError as exc:
-            raise ServiceError(
-                "cache_unavailable",
-                f"缓存协调失败，无法{context}（{exc.__class__.__name__}），请重试",
-                503,
-                retryable=True,
-            ) from exc
+            raise self._redis_error(exc, context) from exc
         snap.pop("result_seq", None)
         return snap
 
@@ -309,10 +452,18 @@ class TagService:
             status = "cached"
         else:
             status = "unknown"
+        # While unconfirmed, the authoritative digest is the last-confirmed
+        # snapshot, not the candidate parked in state.digest.
+        if unconfirmed and state and state.get("confirmed_digest"):
+            authoritative_digest = state["confirmed_digest"]
+            authoritative_gen = int(state.get("confirmed_gen") or 0)
+        else:
+            authoritative_digest = (state or {}).get("digest")
+            authoritative_gen = int((state or {}).get("gen") or 0)
         pub: dict[str, Any] = {
             "status": status,
-            "confirmed_digest": (state or {}).get("digest"),
-            "confirmed_generation": int((state or {}).get("gen") or 0),
+            "confirmed_digest": authoritative_digest,
+            "confirmed_generation": authoritative_gen,
             "pending": None,
             "last_publish": None,
         }
@@ -346,11 +497,20 @@ class TagService:
         coalesced: bool = False,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        state = snap["state"]
+        state = dict(snap["state"])
         assert state is not None
         pending = snap["pending"] or snap.get("unconfirmed")
+        unconfirmed = snap.get("unconfirmed")
+        # While a publication is parked as unconfirmed (e.g. its durability
+        # acknowledgement failed), the candidate digest in ``digest`` must not
+        # be presented as confirmed: serve the authoritative last-confirmed
+        # snapshot instead.
+        if unconfirmed and state.get("confirmed_digest"):
+            state["digest"] = state["confirmed_digest"]
+            if state.get("confirmed_gen"):
+                state["gen"] = state["confirmed_gen"]
         publication = self._publication(
-            state, snap["pending"], snap["last_publish"], snap.get("unconfirmed")
+            snap["state"], snap["pending"], snap["last_publish"], unconfirmed
         )
         body: dict[str, Any] = {
             "tag": tag,
@@ -393,15 +553,11 @@ class TagService:
     # ------------------------------------------------------------------ query
     async def get_tag(self, tag: str, refresh: bool = False) -> dict[str, Any]:
         self.validate_tag(tag)
+        self._require_ready("查询标签")
         try:
             snap = await self._miss_snapshot(tag)
         except RedisError as exc:
-            raise ServiceError(
-                "cache_unavailable",
-                f"缓存协调失败，无法读取标签 {tag}（{exc.__class__.__name__}），请重试",
-                503,
-                retryable=True,
-            ) from exc
+            raise self._redis_error(exc, f"读取标签 {tag}") from exc
 
         state = snap["state"]
         if not refresh and state and int(state.get("fresh_until") or 0) > _now_ms():
@@ -435,12 +591,7 @@ class TagService:
                     )
                 )
             except RedisError as exc:
-                raise ServiceError(
-                    "cache_unavailable",
-                    f"缓存协调失败，无法获得回源锁（{exc.__class__.__name__}），请重试",
-                    503,
-                    retryable=True,
-                ) from exc
+                raise self._redis_error(exc, "获得回源锁") from exc
 
             if acquired:
                 return await self._lead_fetch(tag, lock_token, force=force)
@@ -504,12 +655,7 @@ class TagService:
                 expected_gen = int((state_before or {}).get("gen") or 0)
                 write_token = int(await self.redis.incr(_key(tag, "fetch_seq")))
             except RedisError as exc:
-                raise ServiceError(
-                    "cache_unavailable",
-                    f"缓存协调失败，无法准备回源（{exc.__class__.__name__}），请重试",
-                    503,
-                    retryable=True,
-                ) from exc
+                raise self._redis_error(exc, "准备回源") from exc
 
             await self._stat("origin_fetches")
             try:
@@ -582,12 +728,7 @@ class TagService:
                     str(STATE_TTL_MS),
                 )
             except RedisError as exc:
-                raise ServiceError(
-                    "cache_unavailable",
-                    f"缓存协调失败，无法写入回源结果（{exc.__class__.__name__}），请重试",
-                    503,
-                    retryable=True,
-                ) from exc
+                raise self._redis_error(exc, "写入回源结果") from exc
 
             written_status = int(written[0]) if isinstance(written, (list, tuple)) else int(written)
             if written_status == -1:
@@ -680,12 +821,7 @@ class TagService:
                 pipe.exists(_key(tag, "lock"))
                 state, _result_seq, error, lock_exists = await pipe.execute()
             except RedisError as exc:
-                raise ServiceError(
-                    "cache_unavailable",
-                    f"缓存协调失败，等待回源时无法读取状态（{exc.__class__.__name__}），请重试",
-                    503,
-                    retryable=True,
-                ) from exc
+                raise self._redis_error(exc, "等待回源时读取状态") from exc
 
             state_result_seq = int((state or {}).get("result_seq") or 0)
             error_result_seq = int((error or {}).get("result_seq") or 0)
@@ -758,15 +894,11 @@ class TagService:
         idem_key = f"artifact:publish_request:{tag}:{request_id}"
         started_key = f"artifact:publish_started:{tag}:{request_id}"
 
+        self._require_ready("发布标签")
         try:
             cached = await self.redis.get(idem_key)
         except RedisError as exc:
-            raise ServiceError(
-                "cache_unavailable",
-                f"缓存协调失败，无法读取发布记录（{exc.__class__.__name__}），请重试",
-                503,
-                retryable=True,
-            ) from exc
+            raise self._redis_error(exc, "读取发布记录") from exc
         if cached:
             return await self._deduplicated_result(tag, cached)
 
@@ -782,12 +914,7 @@ class TagService:
                     break
                 cached = await self.redis.get(idem_key)
             except RedisError as exc:
-                raise ServiceError(
-                    "cache_unavailable",
-                    f"缓存协调失败，无法获得发布锁（{exc.__class__.__name__}），请重试",
-                    503,
-                    retryable=True,
-                ) from exc
+                raise self._redis_error(exc, "获得发布锁") from exc
             if cached:
                 return await self._deduplicated_result(tag, cached)
             await asyncio.sleep(POLL_INTERVAL_S)
@@ -804,18 +931,20 @@ class TagService:
         try:
             snap = await self._snapshot_checked(tag, "检查发布前状态")
             state = snap["state"]
-            current_digest = (state or {}).get("digest")
-            current_gen = int((state or {}).get("gen") or 0)
+            # Compare retries against the *authoritative confirmed* snapshot:
+            # a candidate parked by a failed durability ack must not count as
+            # already applied.
+            if snap.get("unconfirmed") and (state or {}).get("confirmed_digest"):
+                current_digest = state["confirmed_digest"]
+                current_gen = int(state.get("confirmed_gen") or 0)
+            else:
+                current_digest = (state or {}).get("digest")
+                current_gen = int((state or {}).get("gen") or 0)
 
             try:
                 started = await self.redis.hgetall(started_key)
             except RedisError as exc:
-                raise ServiceError(
-                    "cache_unavailable",
-                    f"缓存协调失败，无法读取发布尝试记录（{exc.__class__.__name__}），请重试",
-                    503,
-                    retryable=True,
-                ) from exc
+                raise self._redis_error(exc, "读取发布尝试记录") from exc
 
             if started:
                 if started.get("digest") != digest:
@@ -877,12 +1006,7 @@ class TagService:
                     _key(tag, "pub_unconfirmed"), self.s.unconfirmed_ttl_s
                 )
             except RedisError as exc:
-                raise ServiceError(
-                    "cache_unavailable",
-                    f"缓存协调失败，无法登记发布状态（{exc.__class__.__name__}），请重试",
-                    503,
-                    retryable=True,
-                ) from exc
+                raise self._redis_error(exc, "登记发布状态") from exc
 
             try:
                 response = await self.origin.post(
@@ -930,16 +1054,30 @@ class TagService:
                 )
 
             now = _now_ms()
+            record = {
+                "tag": tag,
+                "digest": digest,
+                "generation": attempt,
+                "origin_revision": revision,
+                "request_id": request_id,
+                "status": "confirmed",
+                "applied": True,
+                "deduplicated": False,
+                "resumed": resumed,
+                "instance": self.s.instance_name,
+                "published_at": _iso(now),
+            }
             try:
                 result = await self.redis.eval(
                     _COMMIT_PUBLISH_LUA,
-                    6,
+                    7,
                     _key(tag, "state"),
                     _key(tag, "pending"),
                     _key(tag, "fetch_seq"),
                     _key(tag, "last_publish"),
                     _key(tag, "result_seq"),
                     _key(tag, "pub_unconfirmed"),
+                    idem_key,
                     str(attempt),
                     str(attempt),
                     digest,
@@ -949,23 +1087,24 @@ class TagService:
                     request_id,
                     str(STATE_TTL_MS),
                     str(self.s.publish_record_ttl_s),
+                    json.dumps(record),
+                    str(self.s.publish_record_ttl_s),
                 )
             except RedisError as exc:
                 # The origin accepted the publish; the cache commit is what is
                 # unconfirmed.  Keep the marker so readers know the old cached
                 # digest is not this publication's result.
                 await self._clear_pending(tag, attempt)
-                raise ServiceError(
-                    "cache_unavailable",
-                    f"源站已更新但缓存确认失败（{exc.__class__.__name__}），发布未确认，"
-                    "请用同一 request_id 重试",
-                    503,
-                    retryable=True,
-                ) from exc
+                raise self._redis_error(exc, "确认发布写入") from exc
 
             status = int(result[0])
             if status == -1:
-                await self._clear_publish_state(tag, attempt, clear_unconfirmed=True)
+                # A newer publication already won.  Do not clear the
+                # unconfirmed marker here: this candidate was never durability
+                # acknowledged, and a same-request_id retry must reconcile via
+                # the superseded/already-applied paths rather than pretend the
+                # uncertainty is gone.
+                await self._clear_pending(tag, attempt)
                 after = await self._snapshot_checked(tag, "读取当前摘要")
                 raise ServiceError(
                     "publish_stale",
@@ -978,32 +1117,43 @@ class TagService:
                     },
                 )
             if status == -2:
-                await self._clear_publish_state(tag, attempt, clear_unconfirmed=True)
+                await self._clear_pending(tag, attempt)
                 raise ServiceError(
                     "publish_conflict",
                     "检测到更新的发布在途，本次发布未写入，请重试",
                     409,
                     retryable=True,
                 )
-            record = {
-                "tag": tag,
-                "digest": digest,
-                "generation": int(result[1]),
-                "origin_revision": revision,
-                "request_id": request_id,
-                "status": "confirmed",
-                "applied": True,
-                "deduplicated": False,
-                "resumed": resumed,
-                "instance": self.s.instance_name,
-                "published_at": _iso(now),
-            }
+            # The commit (candidate state + generation + last_publish) is one
+            # atomic AOF write.  Do not report success until it has been
+            # fsync'd: if the durability acknowledgement fails, keep the
+            # unconfirmed marker and surface an explicit retryable error, with
+            # no idempotent success record left behind; readers keep serving
+            # the previous confirmed snapshot.
+            await self._wait_durability()
+            # Durability confirmed: promote the candidate to the authoritative
+            # confirmed snapshot and clear the unconfirmed marker.  These are
+            # themselves AOF'd; if they fail the commit is already durable and
+            # a same-request_id retry resolves via _already_applied.
             try:
                 await self.redis.set(
                     idem_key, json.dumps(record), ex=self.s.publish_record_ttl_s
                 )
-            except RedisError:
-                record["warning"] = "发布已确认，但幂等重试记录写入失败；重试时请先查询状态"
+                await self.redis.eval(
+                    _PROMOTE_CONFIRMED_LUA,
+                    2,
+                    _key(tag, "state"),
+                    _key(tag, "pub_unconfirmed"),
+                    digest,
+                    str(attempt),
+                    str(attempt),
+                    str(STATE_TTL_MS),
+                )
+                await self._clear_pending(tag, attempt)
+            except RedisError as exc:
+                raise self._redis_error(exc, "确认发布结果") from exc
+            record["generation"] = int(result[1])
+            record["durable"] = True
             return record
         finally:
             await self._release_lock(lock_key, lock_token)
@@ -1131,17 +1281,13 @@ class TagService:
         flight path.
         """
         self.validate_tag(tag)
+        self._require_ready("使缓存失效")
         try:
             state = await self.redis.hgetall(_key(tag, "state"))
             if state:
                 await self.redis.hset(_key(tag, "state"), "fresh_until", "0")
         except RedisError as exc:
-            raise ServiceError(
-                "cache_unavailable",
-                f"缓存协调失败，无法清除标签 {tag} 的新鲜度（{exc.__class__.__name__}），请重试",
-                503,
-                retryable=True,
-            ) from exc
+            raise self._redis_error(exc, f"清除标签 {tag} 的新鲜度") from exc
         return {
             "tag": tag,
             "invalidated": bool(state),
@@ -1153,14 +1299,26 @@ class TagService:
     # ----------------------------------------------------------------- status
     async def status(self, tag: str) -> dict[str, Any]:
         self.validate_tag(tag)
+        self._require_ready("读取发布状态")
         snap = await self._snapshot_checked(tag, "读取发布状态")
         state = snap["state"]
+        unconfirmed = snap.get("unconfirmed")
+        # Mirror the query path: while an unconfirmed publication is parked,
+        # the confirmed digest/generation are the authoritative ones.
+        confirmed_digest = (state or {}).get("digest")
+        confirmed_generation = int((state or {}).get("gen") or 0)
+        if unconfirmed and (state or {}).get("confirmed_digest"):
+            confirmed_digest = state["confirmed_digest"]
+            confirmed_generation = int(state.get("confirmed_gen") or 0)
         return {
             "tag": tag,
             "instance": self.s.instance_name,
-            "publication": self._publication(state, snap["pending"], snap["last_publish"]),
-            "cached_digest": (state or {}).get("digest"),
-            "generation": int((state or {}).get("gen") or 0),
+            "publication": self._publication(
+                state, snap["pending"], snap["last_publish"], unconfirmed
+            ),
+            "cached_digest": confirmed_digest,
+            "generation": confirmed_generation,
+            "candidate_digest": (state or {}).get("digest") if unconfirmed else None,
             "origin_revision": int((state or {}).get("origin_revision") or 0),
             "cached_at": _iso((state or {}).get("cached_at")),
             "fresh_until": _iso((state or {}).get("fresh_until")),
@@ -1174,12 +1332,7 @@ class TagService:
                 [f"stats:gateway:{self.s.instance_name}:{n}" for n in names]
             )
         except RedisError as exc:
-            raise ServiceError(
-                "cache_unavailable",
-                f"缓存协调失败，无法读取统计（{exc.__class__.__name__}）",
-                503,
-                retryable=True,
-            ) from exc
+            raise self._redis_error(exc, "读取统计") from exc
         counts = {name: int(value or 0) for name, value in zip(names, values)}
         counts["instance"] = self.s.instance_name
         return counts

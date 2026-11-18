@@ -1,7 +1,29 @@
 services:
   redis:
     image: redis:7.2-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    # AOF persistence is required for the recovery interleave: confirmed
+    # digests, publication generations and request_id records must survive a
+    # Redis restart.  ``everysec`` fsync plus an explicit WAITAOF after each
+    # publish commit means a client is only told "confirmed" once the commit
+    # is durable.  A named volume keeps the AOF across ``docker compose
+    # restart``/``up`` cycles; remove it (``docker compose down -v``) to start
+    # from an empty store.
+    command:
+      [
+        "redis-server",
+        "--appendonly",
+        "yes",
+        "--appendfsync",
+        "everysec",
+        "--save",
+        "",
+        "--auto-aof-rewrite-percentage",
+        "100",
+        "--auto-aof-rewrite-min-size",
+        "1mb",
+      ]
+    volumes:
+      - redis-aof:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -81,3 +103,6 @@ services:
       retries: 30
     ports:
       - "8002:8000"
+
+volumes:
+  redis-aof:

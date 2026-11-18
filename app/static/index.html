@@ -161,7 +161,7 @@
         <button class="primary" id="publishBtn">发布并确认</button>
         <button class="ghost" id="newRequestBtn" type="button">生成新 request_id</button>
       </div>
-      <div class="hint">发布 = 写源站 + 原子写入缓存并递增发布代号；确认后的查询不会看到旧摘要。重试同一 request_id 不会回退较新发布。</div>
+      <div class="hint">发布 = 写源站 + 原子写入缓存并递增发布代号 + 等待 AOF 持久化确认（WAITAOF）；只有持久化确认后才返回“已确认”。Redis 重启后已确认摘要、代号与同 request_id 结果仍保留；恢复期间请求明确报 503 暂不可用。重试同一 request_id 不会回退较新发布。</div>
       <div id="publishResult"></div>
     </div>
   </section>
@@ -295,11 +295,16 @@
     const text = $("healthText");
     if (!ok || !body.redis || !body.redis.ok) {
       dot.className = "dot bad";
-      text.textContent = "Redis 不可用";
+      text.textContent = "Redis 不可用 · 缓存恢复中，请求将明确报暂不可用";
+      return;
+    }
+    if (body.ready === false || body.recovering) {
+      dot.className = "dot warn";
+      text.textContent = `缓存恢复中（AOF 重载）· 实例 ${body.instance}`;
       return;
     }
     dot.className = "dot ok";
-    text.textContent = `Redis 正常 · 实例 ${body.instance}`;
+    text.textContent = `Redis 正常（AOF 持久化）· 实例 ${body.instance}`;
   }
 
   async function publish() {
@@ -322,9 +327,10 @@
         return;
       }
       const badge = body.status === "confirmed" ? "已确认" : body.status;
+      const durable = body.durable === true ? " · AOF 已持久化" : "";
       $("publishResult").innerHTML = `
         <div class="cards">
-          <div class="card"><div class="k">状态</div><div class="v tag-ok">${esc(badge)}</div></div>
+          <div class="card"><div class="k">状态</div><div class="v tag-ok">${esc(badge)}${esc(durable)}</div></div>
           <div class="card"><div class="k">摘要</div><div class="v digest">${esc(body.digest)}</div></div>
           <div class="card"><div class="k">发布代号</div><div class="v">${esc(body.generation)}</div></div>
           <div class="card"><div class="k">源站版本</div><div class="v">${esc(body.origin_revision)}</div></div>
@@ -499,6 +505,7 @@
       <span class="k">发布状态</span><span class="${p.status === "confirmed" ? "tag-ok" : p.status === "publishing" ? "tag-warn" : ""}">${esc(p.status)}</span>
       <span class="k">已确认摘要</span><span class="mono">${esc(body.cached_digest ?? "—")}</span>
       <span class="k">发布代号</span><span class="mono">${esc(body.generation)}</span>
+      <span class="k">未确认候选摘要</span><span class="mono">${body.candidate_digest ? esc(body.candidate_digest) + ' <span class="tag-warn">尚未确认</span>' : "—"}</span>
       <span class="k">源站版本</span><span class="mono">${esc(body.origin_revision)}</span>
       <span class="k">缓存时间</span><span class="mono">${esc(body.cached_at ?? "—")}</span>
       <span class="k">新鲜至</span><span class="mono">${esc(body.fresh_until ?? "—")}</span>

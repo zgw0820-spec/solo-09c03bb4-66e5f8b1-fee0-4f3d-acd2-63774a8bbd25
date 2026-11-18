@@ -22,6 +22,13 @@ def _env_str(name: str, default: str) -> str:
     return value.strip() if value and value.strip() else default
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     redis_url: str
@@ -36,6 +43,8 @@ class Settings:
     revalidate_ttl_s: int
     fetch_state_ttl_s: int
     publish_record_ttl_s: int
+    durability_ack_enabled: bool
+    aof_wait_timeout_ms: int
     instance_name: str
     public_instances: tuple[str, ...]
 
@@ -67,6 +76,8 @@ class Settings:
             publish_record_ttl_s=_env_int(
                 "PUBLISH_RECORD_TTL_S", 604_800, 60, 2_592_000
             ),
+            durability_ack_enabled=_env_bool("DURABILITY_ACK_ENABLED", True),
+            aof_wait_timeout_ms=_env_int("AOF_WAIT_TIMEOUT_MS", 2_000, 10, 60_000),
             instance_name=_env_str("INSTANCE_NAME", "query"),
             public_instances=instances,
         )

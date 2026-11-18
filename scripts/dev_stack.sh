@@ -16,7 +16,12 @@ pkill -f 'uvicorn origin.main:app' >/dev/null 2>&1 || true
 sleep 1
 
 if ! redis-cli -p "$REDIS_PORT" ping >/dev/null 2>&1; then
-  redis-server --port "$REDIS_PORT" --save '' --appendonly no \
+  # AOF on: confirmed publications must survive a local Redis restart, and the
+  # gateway's WAITAOF gate requires appendonly=yes.
+  mkdir -p "$LOG_DIR/redis-data"
+  redis-server --port "$REDIS_PORT" --save '' \
+    --appendonly yes --appendfsync everysec \
+    --dir "$LOG_DIR/redis-data" \
     --daemonize yes --pidfile "$LOG_DIR/redis.pid" --logfile "$LOG_DIR/redis.log"
 fi
 
